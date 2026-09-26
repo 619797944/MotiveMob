@@ -1,0 +1,13 @@
+# Core data processing and evaluation
+numpy==2.3.0
+pandas==2.3.0
+scipy>=1.10
+tqdm==4.67.1
+
+# Model training and inference
+torch==2.7.1
+transformers==4.52.4
+datasets==3.6.0
+peft==0.15.2
+accelerate==1.7.0
+bitsandbytes>=0.43.0

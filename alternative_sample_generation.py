@@ -4,7 +4,7 @@ import argparse
 import pickle
 import re
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -236,6 +236,56 @@ def extract_prediction(val):
     m = re.search(r'"prediction"\s*:\s*"([^"]+)"', str(val))
     return m.group(1) if m else val
 
+HISTORY_DAYS = 3
+
+def build_traj_by_date(trajectories) -> Dict[pd.Timestamp, List[str]]:
+    """One user's trajectories -> {date: steps}, for looking back at earlier days."""
+    traj_by_date = {}
+    for traj in trajectories:
+        date_str, steps = extract_date_and_steps_llm(traj)
+        if not date_str or not steps:
+            continue
+        traj_by_date[pd.to_datetime(date_str)] = steps
+    return traj_by_date
+
+def build_recent_history(traj_by_date: Dict[pd.Timestamp, List[str]], cur_date, days: int = HISTORY_DAYS) -> str:
+    """Join the most recent `days` days strictly before cur_date (prompt_builder.py's
+    expected "Activities at <date>: <step>, <step>, ..." per line, newline-joined).
+    Empty string if there are no earlier days."""
+    cur_date = pd.to_datetime(cur_date)
+    prev_dates = sorted(d for d in traj_by_date if d < cur_date)[-days:]
+    return "\n".join(
+        f"Activities at {d.strftime('%Y-%m-%d')}: {', '.join(traj_by_date[d])}"
+        for d in prev_dates
+    )
+
+def _resolve_person_path(person, pkl_dir: Path) -> Path:
+    p = Path(person)
+    if p.is_file():
+        return p
+    candidate = pkl_dir / p.name
+    if candidate.is_file():
+        return candidate
+    raise FileNotFoundError(f"Cannot find pkl for person={person!r} (tried {p} and {candidate})")
+
+def history_lookup_for_persons(persons: List[str], dates: List, pkl_dir: Path, days: int = HISTORY_DAYS) -> List[str]:
+    """Row-wise history for rows that only carry a person path + date (e.g. rows
+    read back from a judge/llm_judge CSV) - opens each unique person's pkl once."""
+    cache: Dict[str, Dict[pd.Timestamp, List[str]]] = {}
+    histories = []
+    for person, date in zip(persons, dates):
+        if person not in cache:
+            try:
+                pkl_path = _resolve_person_path(person, pkl_dir)
+                with open(pkl_path, "rb") as f:
+                    obj = pickle.load(f)
+                trajectories, _motivations, _report = parse_user_pkl_llm(obj)
+                cache[person] = build_traj_by_date(trajectories)
+            except Exception:
+                cache[person] = {}
+        histories.append(build_recent_history(cache[person], date, days=days))
+    return histories
+
 def construct_llm_df(
     input_csv="prompt_trained_alt_predictions_4000.csv",  # change to the llama8 output filename
     text_col="llama_prompt_predictions",
@@ -251,6 +301,7 @@ def construct_llm_df(
         "is_weekend",
         "motivation_id",
         "llm_text",
+        "history",
     ]
 
     # ============================================================
@@ -288,9 +339,11 @@ def construct_llm_df(
         if c not in old_df.columns:
             old_df[c] = None
 
+    old_df["person"] = old_df["person"].astype(str)
+    old_df["history"] = history_lookup_for_persons(old_df["person"].tolist(), old_df["date"].tolist(), pkl_dir)
+
     old_df = old_df[output_columns]
     old_df = old_df.dropna(subset=["llm_text"])  # drop rows with no correct answer
-    old_df["person"] = old_df["person"].astype(str)
 
     print("Loaded prediction rows:", len(old_df))
 
@@ -312,6 +365,7 @@ def construct_llm_df(
             obj = pickle.load(f)
 
         trajectories, motivations, report = parse_user_pkl_llm(obj)
+        traj_by_date = build_traj_by_date(trajectories)
 
         for ti, traj in enumerate(trajectories):
             date, steps = extract_date_and_steps_llm(traj)
@@ -344,6 +398,7 @@ def construct_llm_df(
                 "is_weekend": weekend_flag,
                 "motivation_id": mot2id[motivation],
                 "llm_text": steps[0],
+                "history": build_recent_history(traj_by_date, date),
             }
 
             rows.append(row)
@@ -413,22 +468,24 @@ def construct_df_pos():
             obj = pickle.load(f)
 
         trajectories, motivations, report = parse_user_pkl_llm(obj)
-    
+        traj_by_date = build_traj_by_date(trajectories)
+
         for ti, traj in enumerate(trajectories):
             date, steps = extract_date_and_steps_llm(traj)
             if len(steps) < 2:
                 continue
-            
+
             date = pd.to_datetime(date)
             year = date.year
             month = date.month
             day = date.day
             weekend_flag = is_weekend(date)
+            history = build_recent_history(traj_by_date, date)
             cur_loc_id, cur_time = steps[0].split(' at ')
             cur_loc, cur_id = cur_loc_id.strip().split("#")[0], cur_loc_id.strip().split("#")[1]
             raw_mot = [0, 0, 0, 0, 0, activity_map[cur_loc], cur_loc]
             motivation = classify_motivation(raw_mot)
-            
+
             row = {
                 "person": p,
                 "original": "START",
@@ -439,13 +496,14 @@ def construct_df_pos():
                 "is_weekend": weekend_flag,
 
                 "motivation_id": mot2id[motivation],
-                "llm_text": steps[0]
+                "llm_text": steps[0],
+                "history": history,
             }
 
             rows.append(row)
             for i in range(len(steps) - 1):
                 motivation = mot2id[motivations[ti][i]]
-                
+
                 row = {
                     "person": p,
                     "original": steps[i],
@@ -456,7 +514,8 @@ def construct_df_pos():
                     "is_weekend": weekend_flag,
 
                     "motivation_id": motivation,
-                    "llm_text": steps[i+1]
+                    "llm_text": steps[i+1],
+                    "history": history,
                 }
 
                 rows.append(row)
@@ -483,17 +542,19 @@ def construct_df_phase2():
             obj = pickle.load(f)
 
         trajectories, motivations, report = parse_user_pkl_llm(obj)
-    
+        traj_by_date = build_traj_by_date(trajectories)
+
         for ti, traj in enumerate(trajectories):
             date, steps = extract_date_and_steps_llm(traj)
             if len(steps) < 2:
                 continue
-            
+
             date = pd.to_datetime(date)
             year = date.year
             month = date.month
             day = date.day
             weekend_flag = is_weekend(date)
+            history = build_recent_history(traj_by_date, date)
             cur_loc_id, cur_time = steps[0].split(' at ')
             cur_loc, cur_id = cur_loc_id.strip().split("#")[0], cur_loc_id.strip().split("#")[1]
             raw_mot = [0, 0, 0, 0, 0, activity_map[cur_loc], cur_loc]
@@ -508,6 +569,7 @@ def construct_df_phase2():
                 "is_weekend": weekend_flag,
 
                 "motivation": motivation,
+                "history": history,
             }
             rows.append(row)
             for i in range(len(steps) - 1):
@@ -520,8 +582,8 @@ def construct_df_phase2():
                 next_loc, next_id = next_loc_id.strip().split("#")[0], next_loc_id.strip().split("#")[1]
                 next_loc = subcat2id[next_loc.strip()]
                 motivation = motivations[ti][i]
-                
-                
+
+
                 row = {
                     "person": p,
                     "original": steps[i],
@@ -542,6 +604,7 @@ def construct_df_phase2():
                     "next_id": next_id,
 
                     "motivation": motivation,
+                    "history": history,
                 }
                 rows.append(row)
             # Add END row
@@ -555,6 +618,7 @@ def construct_df_phase2():
                     "is_weekend": weekend_flag,
 
                     "motivation": "END",
+                    "history": history,
                 }
             rows.append(row)
 
@@ -619,7 +683,7 @@ def _run_gen_data(args):
 # 3. Positive/negative mixing (from mix_pos_neg.py)
 # ==========================================================================
 
-MIX_REQUIRED = ["person", "original", "motivation_id", "llm_text", "date", "is_weekend"]
+MIX_REQUIRED = ["person", "original", "motivation_id", "llm_text", "date", "is_weekend", "history"]
 
 def mix_ensure_cols(df: pd.DataFrame, name: str):
     miss = [c for c in MIX_REQUIRED if c not in df.columns]
