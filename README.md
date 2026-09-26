@@ -24,6 +24,7 @@ MotiveMob/
 ├── implicit_world_modeling.py    LoRA fine-tune: state predictor (next state)
 ├── motivation_predictor_training.py  LoRA fine-tune: motivation predictor
 ├── inference.py                  constrained trajectory generation + post-processing
+├── merge_inference_shards.py     merge inference.py's per-shard CSVs into one file
 ├── evaluation.py                 SD/SI/DARD/STVD metrics, real vs. generated trajectories
 ├── prompt_builder.py             shared prompt templates (state/motivation/judge)
 ├── utils.py                      shared training helpers (DDP, report parsing, 4-bit+LoRA loading)
@@ -79,13 +80,25 @@ python motivation_predictor_training.py \
     --phase1_lora None \
     --save_path ft_out/phase2_motivation/llama_8B_phase2
 
-# 6. Inference (bring your own held-out csv_in with person/date/is_weekend/report/history columns)
+# 6. Inference (bring your own held-out csv_in with person/date/is_weekend/report/history
+#    columns - plus a real_traj column, ground-truth trajectory for that person/date in
+#    the same "Activities at <date>: A at HH:MM:SS, B at HH:MM:SS, ..." string format that
+#    inference.py writes to gen_traj; evaluation.py in step 8 requires it and inference.py
+#    won't add it for you, it only passes csv_in's own columns through untouched)
+#    inference.py writes one CSV per shard - out_shard{shard_id}.csv by default
+#    (or shard_{shard_id}.csv inside --csv_out, if that was passed), one shard for
+#    every --shard_id 0..num_shards-1 you ran. It never merges them itself.
 python inference.py \
     --csv_in <your_inference_input.csv> --model <llama_path> \
     --phase1_lora ft_out/phase1_next_state/llama_8B_phase1 \
     --phase2_lora ft_out/phase2_motivation/llama_8B_phase2
+# (optional sharding for large runs: --num_shards N --shard_id i, run once per shard)
 
-# 7. Evaluate generated vs. real trajectories
+# 7. Merge the shard CSVs into the single file evaluation.py expects
+python merge_inference_shards.py --shard_dir . --output_csv merged.csv
+# (pass --shard_glob "shard_*.csv" instead if inference.py was run with --csv_out <dir>)
+
+# 8. Evaluate generated vs. real trajectories (needs person/real_traj/gen_traj columns)
 python evaluation.py --input merged.csv
 ```
 
